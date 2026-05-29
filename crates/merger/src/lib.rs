@@ -124,6 +124,7 @@ fn load_translations(translations_json: &Path) -> Result<Vec<Translation>, Strin
     let base_dir = translations_json.parent().unwrap_or_else(|| Path::new("."));
     let expected_keys: BTreeSet<String> = raw[0].config.keys().cloned().collect();
     let varying_params = varying_params(&raw, &expected_keys)?;
+    let boolean_params = boolean_params_set(&raw, &varying_params);
     let mut feature_map = BTreeMap::<String, (String, String)>::new();
     let mut seen_configs = BTreeSet::<BTreeMap<String, String>>::new();
     let mut translations = Vec::with_capacity(raw.len());
@@ -147,17 +148,23 @@ fn load_translations(translations_json: &Path) -> Result<Vec<Translation>, Strin
         for (param, value) in entry.config {
             let raw_value = config_value_to_string(&param, &value)?;
             if varying_params.contains(&param) {
-                let feature = make_feature_name(&param, &raw_value);
-                if let Some((existing_param, existing_value)) = feature_map.get(&feature) {
-                    if existing_param != &param || existing_value != &raw_value {
-                        return Err(format!(
-                            "feature name collision: {feature:?} maps to both {existing_param}={existing_value} and {param}={raw_value}"
-                        ));
+                if boolean_params.contains(&param) {
+                    if raw_value == "true" {
+                        features.push(param.clone());
                     }
                 } else {
-                    feature_map.insert(feature.clone(), (param.clone(), raw_value.clone()));
+                    let feature = make_feature_name(&param, &raw_value);
+                    if let Some((existing_param, existing_value)) = feature_map.get(&feature) {
+                        if existing_param != &param || existing_value != &raw_value {
+                            return Err(format!(
+                                "feature name collision: {feature:?} maps to both {existing_param}={existing_value} and {param}={raw_value}"
+                            ));
+                        }
+                    } else {
+                        feature_map.insert(feature.clone(), (param.clone(), raw_value.clone()));
+                    }
+                    features.push(feature);
                 }
-                features.push(feature);
             }
             config.insert(param.clone(), raw_value);
         }
@@ -174,6 +181,17 @@ fn load_translations(translations_json: &Path) -> Result<Vec<Translation>, Strin
     }
 
     Ok(translations)
+}
+
+fn boolean_params_set(raw: &[RawTranslation], varying_params: &BTreeSet<String>) -> BTreeSet<String> {
+    varying_params
+        .iter()
+        .filter(|param| {
+            raw.iter()
+                .all(|entry| matches!(entry.config.get(*param), Some(Value::Bool(_))))
+        })
+        .cloned()
+        .collect()
 }
 
 fn varying_params(
@@ -561,16 +579,21 @@ fn simplified_cfg_condition(
                 .collect::<BTreeMap<_, _>>()
         })
         .collect::<Vec<_>>();
-    let feature_lists = params
+    let feature_lists: Vec<Vec<Option<String>>> = params
         .iter()
         .zip(&value_lists)
         .map(|(param, values)| {
-            values
-                .iter()
-                .map(|value| make_feature_name(param, value))
-                .collect::<Vec<_>>()
+            if values == &["false".to_string(), "true".to_string()] {
+                // Boolean param: index 0 = "false" (absent), index 1 = "true" (present)
+                vec![None, Some(param.clone())]
+            } else {
+                values
+                    .iter()
+                    .map(|value| Some(make_feature_name(param, value)))
+                    .collect()
+            }
         })
-        .collect::<Vec<_>>();
+        .collect();
 
     let universe = Universe::new(value_lists.iter().map(Vec::len).collect());
     let coords = universe.all_coordinates();
@@ -589,7 +612,7 @@ fn simplified_cfg_condition(
     lower_cfg_expr(&expr, &feature_lists)
 }
 
-fn lower_cfg_expr(expr: &Expr, feature_lists: &[Vec<String>]) -> String {
+fn lower_cfg_expr(expr: &Expr, feature_lists: &[Vec<Option<String>>]) -> String {
     match expr {
         Expr::True => "all()".to_string(),
         Expr::False => "any()".to_string(),
@@ -600,7 +623,7 @@ fn lower_cfg_expr(expr: &Expr, feature_lists: &[Vec<String>]) -> String {
     }
 }
 
-fn lower_cfg_operator(name: &str, args: &[Expr], feature_lists: &[Vec<String>]) -> String {
+fn lower_cfg_operator(name: &str, args: &[Expr], feature_lists: &[Vec<Option<String>>]) -> String {
     let args = args
         .iter()
         .map(|arg| lower_cfg_expr(arg, feature_lists))
@@ -612,7 +635,7 @@ fn lower_cfg_operator(name: &str, args: &[Expr], feature_lists: &[Vec<String>]) 
 fn lower_cfg_literal(
     coord: usize,
     values: &BTreeSet<usize>,
-    feature_lists: &[Vec<String>],
+    feature_lists: &[Vec<Option<String>>],
 ) -> String {
     let domain_size = feature_lists[coord].len();
     if values.is_empty() {
@@ -622,7 +645,7 @@ fn lower_cfg_literal(
         return "all()".to_string();
     }
     if values.len() == 1 {
-        return feature_clause(&feature_lists[coord][*values.iter().next().unwrap()]);
+        return cfg_for_value(coord, *values.iter().next().unwrap(), feature_lists);
     }
 
     let positive_cost = values.len() + 1;
@@ -638,20 +661,33 @@ fn lower_cfg_literal(
     if positive_cost <= negative_cost {
         let clauses = values
             .iter()
-            .map(|value| feature_clause(&feature_lists[coord][*value]))
+            .map(|&value| cfg_for_value(coord, value, feature_lists))
             .collect::<Vec<_>>();
         lower_cfg_primitive_or(&clauses)
     } else if excluded.len() == 1 {
         format!(
             "not({})",
-            feature_clause(&feature_lists[coord][excluded[0]])
+            cfg_for_value(coord, excluded[0], feature_lists)
         )
     } else {
         let clauses = excluded
             .into_iter()
-            .map(|value| feature_clause(&feature_lists[coord][value]))
+            .map(|value| cfg_for_value(coord, value, feature_lists))
             .collect::<Vec<_>>();
         format!("not({})", lower_cfg_primitive_or(&clauses))
+    }
+}
+
+fn cfg_for_value(coord: usize, value_idx: usize, feature_lists: &[Vec<Option<String>>]) -> String {
+    match &feature_lists[coord][value_idx] {
+        Some(name) => feature_clause(name),
+        None => {
+            let pos = feature_lists[coord]
+                .iter()
+                .find_map(|o| o.as_deref())
+                .expect("boolean coord must have a positive feature");
+            format!("not({})", feature_clause(pos))
+        }
     }
 }
 
@@ -825,11 +861,18 @@ mod tests {
     fn translation_with_features(
         config: BTreeMap<String, String>,
         varying_params: &BTreeSet<String>,
+        boolean_params: &BTreeSet<String>,
     ) -> Translation {
         let features = config
             .iter()
             .filter(|(param, _)| varying_params.contains(*param))
-            .map(|(param, value)| make_feature_name(param, value))
+            .filter_map(|(param, value)| {
+                if boolean_params.contains(param) {
+                    if value == "true" { Some(param.clone()) } else { None }
+                } else {
+                    Some(make_feature_name(param, value))
+                }
+            })
             .collect::<Vec<_>>();
 
         Translation {
@@ -862,34 +905,40 @@ mod tests {
 
     #[test]
     fn merged_cfg_attribute_uses_cofactor_simplification() {
+        let varying = ["os".to_string(), "arch".to_string()].into_iter().collect();
+        let no_bools = BTreeSet::new();
         let translations = vec![
             translation_with_features(
                 [("os", "linux"), ("arch", "x86")]
                     .into_iter()
                     .map(|(param, value)| (param.to_string(), value.to_string()))
                     .collect(),
-                &["os".to_string(), "arch".to_string()].into_iter().collect(),
+                &varying,
+                &no_bools,
             ),
             translation_with_features(
                 [("os", "linux"), ("arch", "arm")]
                     .into_iter()
                     .map(|(param, value)| (param.to_string(), value.to_string()))
                     .collect(),
-                &["os".to_string(), "arch".to_string()].into_iter().collect(),
+                &varying,
+                &no_bools,
             ),
             translation_with_features(
                 [("os", "mac"), ("arch", "x86")]
                     .into_iter()
                     .map(|(param, value)| (param.to_string(), value.to_string()))
                     .collect(),
-                &["os".to_string(), "arch".to_string()].into_iter().collect(),
+                &varying,
+                &no_bools,
             ),
             translation_with_features(
                 [("os", "mac"), ("arch", "arm")]
                     .into_iter()
                     .map(|(param, value)| (param.to_string(), value.to_string()))
                     .collect(),
-                &["os".to_string(), "arch".to_string()].into_iter().collect(),
+                &varying,
+                &no_bools,
             ),
         ];
         let variants = vec![
@@ -911,6 +960,7 @@ mod tests {
     #[test]
     fn merged_cfg_attribute_omits_globally_constant_parameters() {
         let varying_params = ["arch".to_string()].into_iter().collect();
+        let no_bools = BTreeSet::new();
         let translations = vec![
             translation_with_features(
                 [("os", "linux"), ("arch", "x86")]
@@ -918,6 +968,7 @@ mod tests {
                     .map(|(param, value)| (param.to_string(), value.to_string()))
                     .collect(),
                 &varying_params,
+                &no_bools,
             ),
             translation_with_features(
                 [("os", "linux"), ("arch", "arm")]
@@ -925,6 +976,7 @@ mod tests {
                     .map(|(param, value)| (param.to_string(), value.to_string()))
                     .collect(),
                 &varying_params,
+                &no_bools,
             ),
         ];
         let variants = vec![
@@ -942,6 +994,79 @@ mod tests {
         assert_eq!(cfg, Some("#[cfg(feature = \"arch_x86\")]".to_string()));
         assert_eq!(translations[0].features, vec!["arch_x86".to_string()]);
         assert_eq!(translations[1].features, vec!["arch_arm".to_string()]);
+    }
+
+    #[test]
+    fn boolean_param_true_emits_positive_feature() {
+        let varying = ["flag".to_string()].into_iter().collect();
+        let bools: BTreeSet<String> = ["flag".to_string()].into_iter().collect();
+        let translations = vec![
+            translation_with_features(
+                [("flag", "true")]
+                    .into_iter()
+                    .map(|(p, v)| (p.to_string(), v.to_string()))
+                    .collect(),
+                &varying,
+                &bools,
+            ),
+            translation_with_features(
+                [("flag", "false")]
+                    .into_iter()
+                    .map(|(p, v)| (p.to_string(), v.to_string()))
+                    .collect(),
+                &varying,
+                &bools,
+            ),
+        ];
+        let variants = vec![
+            (0, PathBuf::from("flag-true.rs")),
+            (1, PathBuf::from("flag-false.rs")),
+        ];
+        let mut item_variants = BTreeMap::<String, BTreeSet<usize>>::new();
+        item_variants.insert("fn when_true() {}".to_string(), [0usize].into_iter().collect());
+
+        let cfg =
+            merged_cfg_attribute("fn when_true() {}", &item_variants, &translations, &variants);
+        assert_eq!(cfg, Some("#[cfg(feature = \"flag\")]".to_string()));
+        assert_eq!(translations[0].features, vec!["flag".to_string()]);
+        assert_eq!(translations[1].features, Vec::<String>::new());
+    }
+
+    #[test]
+    fn boolean_param_false_emits_negated_feature() {
+        let varying = ["flag".to_string()].into_iter().collect();
+        let bools: BTreeSet<String> = ["flag".to_string()].into_iter().collect();
+        let translations = vec![
+            translation_with_features(
+                [("flag", "true")]
+                    .into_iter()
+                    .map(|(p, v)| (p.to_string(), v.to_string()))
+                    .collect(),
+                &varying,
+                &bools,
+            ),
+            translation_with_features(
+                [("flag", "false")]
+                    .into_iter()
+                    .map(|(p, v)| (p.to_string(), v.to_string()))
+                    .collect(),
+                &varying,
+                &bools,
+            ),
+        ];
+        let variants = vec![
+            (0, PathBuf::from("flag-true.rs")),
+            (1, PathBuf::from("flag-false.rs")),
+        ];
+        let mut item_variants = BTreeMap::<String, BTreeSet<usize>>::new();
+        item_variants.insert(
+            "fn when_false() {}".to_string(),
+            [1usize].into_iter().collect(),
+        );
+
+        let cfg =
+            merged_cfg_attribute("fn when_false() {}", &item_variants, &translations, &variants);
+        assert_eq!(cfg, Some("#[cfg(not(feature = \"flag\"))]".to_string()));
     }
 
     #[test]
