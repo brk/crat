@@ -1,0 +1,94 @@
+name: build and release crat
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit-to-build:
+        description: 'Commit hash to build (and release, by default)'
+        required: true
+        type: string
+      skip-release:
+        type: boolean
+        description: Skip release creation? For build testing
+        default: false
+
+jobs:
+  buildlinux:
+    strategy:
+      fail-fast: true
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+        include:
+          - runner: ubuntu-latest
+            plat_machine: x86_64
+          - runner: ubuntu-24.04-arm
+            plat_machine: aarch64
+    runs-on: ${{ matrix.runner }} 
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0 # check out all revisions so we can build a specific one 
+
+      - name: Log in to the Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Get Git commit timestamp
+        run: echo "TIMESTAMP=$(git log -1 --pretty=%ct ${{ inputs.commit-to-build }})" >> $GITHUB_ENV
+
+      - name: Build Linux deps
+        run: |
+          cd .github/scripts/ 
+          mkdir -p out/bin
+          mkdir -p out/lib
+
+          bash build-via-container.sh "${{ inputs.commit-to-build }}"
+
+          mv out xj-crat
+          tar caf xj-crat_${{ matrix.plat_machine }}.tar.xz xj-crat
+        env:
+          SOURCE_DATE_EPOCH: ${{ env.TIMESTAMP }}
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.plat_machine }}
+          path: .github/scripts/xj-crat_${{ matrix.plat_machine }}.tar.xz
+
+  release:
+    needs: [buildlinux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          merge-multiple: true  # otherwise, we'd get each platform's tarball in separate directories
+
+      - name: Get short hash of the built commit
+        run: echo "CRAT_SHORTHASH=$(echo ${{ inputs.commit-to-build }} | cut -c1-9)" >> $GITHUB_ENV
+
+      - name: Emit job summary
+        run: |
+          echo "- crat shorthash is $CRAT_SHORTHASH" >> $GITHUB_STEP_SUMMARY
+          echo "- skipped release: ${{ inputs.skip-release }}" >> $GITHUB_STEP_SUMMARY
+
+      - name: Create Release via gh
+        if: ${{ ! inputs.skip-release }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create \
+              crat-${{ env.CRAT_SHORTHASH }} \
+              --notes "release for crat rev ${{ inputs.commit-to-build  }}" \
+              --target ${{ inputs.commit-to-build }} \
+              --latest=false \
+              *.tar.xz
