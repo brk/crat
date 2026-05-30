@@ -17,12 +17,10 @@ jobs:
     strategy:
       fail-fast: true
       matrix:
-        runner: [ubuntu-latest, ubuntu-24.04-arm]
+        runner: [ubuntu-latest]
         include:
           - runner: ubuntu-latest
             plat_machine: x86_64
-          - runner: ubuntu-24.04-arm
-            plat_machine: aarch64
     runs-on: ${{ matrix.runner }} 
     permissions:
       contents: read
