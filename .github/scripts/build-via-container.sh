@@ -39,16 +39,23 @@ docker run --rm -i \
   cd crat
   git switch --detach "$BUILD_COMMIT"
 
+  # Deps must be built in debug mode, crat hard codes the debug target path
   cargo build --manifest-path deps_crate/Cargo.toml
+
   cargo build --release
 
   mkdir -p /outputs/bin
   cp ./target/release/crat   /outputs/bin
   cp ./target/release/crat-* /outputs/bin
+
   mkdir -p /outputs/lib
   zzz=$(find /usr/local/rustup -name librustc_driver-e4d0d5450005c30a.so | head -n1)
   cp "$zzz" /outputs/lib
   zzz=$(find /usr/local/rustup -name libLLVM.so.20.1-rust-1.89.0-nightly | head -n1)
   cp "$zzz" /outputs/lib
+
+  mkdir -p                           /outputs/lib/deps_crate/target/debug/
+  cp -r deps_crate/target/debug/deps /outputs/lib/deps_crate/target/debug/
+
   chown -R "$HOST_UID:$HOST_GID" /outputs
 EOF
